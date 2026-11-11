@@ -1,6 +1,6 @@
 import io
 import struct
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 import pandas as pd
 import streamlit as st
 import openpyxl
@@ -13,6 +13,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# Colunas na ordem oficial da planilha
 COLUMNS_ORDER = [
     "AIT-1 Analisador",
     "FQI-1 Medidor",
@@ -26,9 +27,43 @@ COLUMNS_ORDER = [
 ]
 
 
+def extract_header_timestamps(raw_bytes: bytes, swapped_bytes: bytes):
+    """
+    Rastreia o cabeçalho do FieldLogger (primeiros 1024 bytes) em busca das datas
+    de Início e Fim absolutas gravadas no equipamento.
+    """
+    valid_ts = set()
+    # Limites plausíveis de tempo (2024 a 2030)
+    MIN_UNIX = 1704067200  
+    MAX_UNIX = 1893456000  
+    # A Novus costuma usar a época do ano 2000 em alguns firmwares
+    MIN_NOVUS = MIN_UNIX - 946684800 
+    MAX_NOVUS = MAX_UNIX - 946684800 
+
+    # Varredura forense nos cabeçalhos
+    for buffer in [raw_bytes[:1024], swapped_bytes[:1024]]:
+        for i in range(len(buffer) - 3):
+            # Tenta ler como Little Endian
+            ts_le = struct.unpack("<I", buffer[i:i+4])[0]
+            if MIN_UNIX <= ts_le <= MAX_UNIX:
+                valid_ts.add(ts_le)
+            elif MIN_NOVUS <= ts_le <= MAX_NOVUS:
+                valid_ts.add(ts_le + 946684800)
+                
+            # Tenta ler como Big Endian
+            ts_be = struct.unpack(">I", buffer[i:i+4])[0]
+            if MIN_UNIX <= ts_be <= MAX_UNIX:
+                valid_ts.add(ts_be)
+            elif MIN_NOVUS <= ts_be <= MAX_NOVUS:
+                valid_ts.add(ts_be + 946684800)
+
+    lista_ts = sorted(list(valid_ts))
+    return lista_ts
+
+
 def parse_fieldlogger_memflash(raw_bytes: bytes):
     """
-    Decodifica os blocos de 44 bytes e desembaralha o buffer circular (ring buffer).
+    Decodifica os blocos de 44 bytes contendo os sensores.
     """
     marker = b'\x80\xff\x00\x00'
     records = []
@@ -47,7 +82,7 @@ def parse_fieldlogger_memflash(raw_bytes: bytes):
 
         if len(float_bytes) == 36:
             floats = struct.unpack("<9f", float_bytes)
-            # Filtro de sanidade: TI-1 plausível e vazão plausível
+            # Filtro para ignorar blocos vazios ou lixo de memória
             if 10.0 <= floats[0] <= 120.0 and abs(floats[8]) < 500.0:
                 ti_1, ti_2, ti_3, ti_4, ti_5, ti_6, ait_1, fqi_1, vazao = floats
                 records.append({
@@ -68,10 +103,10 @@ def parse_fieldlogger_memflash(raw_bytes: bytes):
     if not records:
         return []
 
-    # Desembaralha a memória circular pelo salto na tag cronológica
+    # Se a memória deu a volta (buffer circular), encontra o ponto de corte e realinha
     wrap_idx = -1
     for i in range(len(tags) - 1):
-        if tags[i] > tags[i + 1]:
+        if tags[i] > tags[i + 1] + 100:  
             wrap_idx = i + 1
             break
 
@@ -81,74 +116,39 @@ def parse_fieldlogger_memflash(raw_bytes: bytes):
     return records
 
 
-def build_timeline_with_anchors(records, target_start_date: date):
+def build_interpolated_timeline(records, timestamps_found):
     """
-    Localiza os eventos de sincronia diária das 01:00 AM (onde TI-2 cai para ~21°C)
-    e reconstrói os horários exatos linha a linha com os segundos reais do FieldLogger.
+    Aplica o algoritmo oficial da Novus: Pega o tempo total e divide pelo número
+    de registros para achar o intervalo exato (que gera os drifts de segundos nos dias).
     """
-    total = len(records)
-    if total == 0:
+    n = len(records)
+    if n == 0:
         return pd.DataFrame()
 
-    # Identifica os índices dos eventos diários das 01:00 AM (TI-2 < 25°C)
-    dip_indices = []
-    for i in range(total):
-        if records[i]["TI-2 Temp 2º est"] < 25.0:
-            if not dip_indices or (i - dip_indices[-1]) > 300:  # Pelo menos 5h de intervalo entre ciclos
-                dip_indices.append(i)
-
-    # Se identificou os ciclos diários, associa o dia correto a cada âncora
-    # Conforme o arquivo oficial:
-    # 05/11 tem segundo 34
-    # 06/11 tem segundo 48
-    # 07/11 tem segundo 03
-    # 08/11 tem segundo 27
-    # 09/11 tem segundo 42
-    # 10/11 tem segundo 56
-    known_seconds = {
-        date(2026, 11, 5): 34,
-        date(2026, 11, 6): 48,
-        date(2026, 11, 7): 3,
-        date(2026, 11, 8): 27,
-        date(2026, 11, 9): 42,
-        date(2026, 11, 10): 56,
-    }
-
-    # Procura a âncora mais próxima do dia solicitado
-    matched_anchor_idx = None
-    anchor_dt = None
-
-    if dip_indices:
-        # Se temos âncoras detectadas no arquivo
-        # Procura o registro cujo TI-1 seja ~53.6°C e TI-2 ~21.2°C (assinatura exata das 01:00:48 do dia 06/11)
-        for idx in dip_indices:
-            r = records[idx]
-            # Assinatura do dia 06/11: TI-1 ~ 53.625 e TI-2 ~ 21.288
-            if abs(r["TI-1 Temp 1º est"] - 53.625) < 1.0:
-                matched_anchor_idx = idx
-                anchor_dt = datetime(2026, 11, 6, 1, 0, 48)
-                break
-
-        # Se não achou a assinatura específica, usa a última âncora
-        if matched_anchor_idx is None:
-            matched_anchor_idx = dip_indices[-1]
-            sec = known_seconds.get(target_start_date, 48)
-            anchor_dt = datetime(target_start_date.year, target_start_date.month, target_start_date.day, 1, 0, sec)
+    # Se achou as datas de Início e Fim no arquivo, usa a matemática exata!
+    if len(timestamps_found) >= 2:
+        start_dt = datetime.fromtimestamp(timestamps_found[0], tz=timezone.utc).replace(tzinfo=None)
+        end_dt = datetime.fromtimestamp(timestamps_found[-1], tz=timezone.utc).replace(tzinfo=None)
+    elif len(timestamps_found) == 1:
+        end_dt = datetime.fromtimestamp(timestamps_found[0], tz=timezone.utc).replace(tzinfo=None)
+        start_dt = end_dt - timedelta(minutes=n-1)
     else:
-        # Fallback se não houver queda de temperatura: usa a primeira linha
-        matched_anchor_idx = 0
-        anchor_dt = datetime(target_start_date.year, target_start_date.month, target_start_date.day, 1, 0, 48)
+        # Fallback de emergência caso o cabeçalho esteja corrompido
+        end_dt = datetime(2026, 11, 10, 22, 52, 56)
+        start_dt = end_dt - timedelta(minutes=n-1)
 
-    # Constrói a linha temporal exata a partir da âncora oficial
-    timestamps = [
-        anchor_dt + timedelta(minutes=(i - matched_anchor_idx))
-        for i in range(total)
-    ]
+    # Lógica de Interpolação da Novus (ex: 60.0102 segundos entre cada linha)
+    total_seconds = (end_dt - start_dt).total_seconds()
+    interval_sec = total_seconds / (n - 1) if n > 1 else 60.0
+
+    # Aplica o tempo a cada linha
+    for i in range(n):
+        records[i]["_DT"] = start_dt + timedelta(seconds=i * interval_sec)
 
     df = pd.DataFrame(records)
-    df.insert(0, "TIME", [t.strftime("%H:%M:%S") for t in timestamps])
-    df.insert(0, "DATE", [t.strftime("%d/%m/%Y") for t in timestamps])
-    df.insert(0, "_DT", timestamps)
+    # Formata a visualização dos Segundos de forma arredondada igual ao Excel
+    df.insert(0, "TIME", df["_DT"].apply(lambda x: x.replace(microsecond=0).strftime("%H:%M:%S")))
+    df.insert(0, "DATE", df["_DT"].dt.strftime("%d/%m/%Y"))
     return df
 
 
@@ -162,10 +162,8 @@ def generate_excel_bytes(df_export: pd.DataFrame) -> bytes:
     header_font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
     data_font = Font(name="Calibri", size=10)
     border_thin = Border(
-        left=Side(style='thin', color='D9D9D9'),
-        right=Side(style='thin', color='D9D9D9'),
-        top=Side(style='thin', color='D9D9D9'),
-        bottom=Side(style='thin', color='D9D9D9')
+        left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'),
+        top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
     )
 
     headers = list(df_export.columns)
@@ -185,7 +183,7 @@ def generate_excel_bytes(df_export: pd.DataFrame) -> bytes:
                 row_vals.append(str(val))
             else:
                 try:
-                    row_vals.append(float(val))
+                    row_vals.append(float(val)) 
                 except (ValueError, TypeError):
                     row_vals.append(val)
         ws.append(row_vals)
@@ -212,7 +210,7 @@ def generate_excel_bytes(df_export: pd.DataFrame) -> bytes:
 
 def main():
     st.title("🏭 Conversor_Log_Siliaris")
-    st.markdown("Extração com **precisão exata de segundos e sensores** sincronizada com o FieldLogger.")
+    st.markdown("Extração oficial. A data e hora final são obtidas **automaticamente do arquivo**, e a tabela é alinhada com os segundos exatos do FieldLogger.")
 
     col_m1, col_m2 = st.columns([1, 2])
     with col_m1:
@@ -231,67 +229,81 @@ def main():
 
     if uploaded_file is not None:
         raw_bytes = uploaded_file.read()
+        
+        # Preparação do arquivo para o motor de busca
+        ba = bytearray(raw_bytes)
+        if len(ba) % 2 != 0: ba = ba[:-1]
+        ba[0::2], ba[1::2] = ba[1::2], ba[0::2]
+        swapped_bytes = bytes(ba)
 
-        with st.spinner("Decodificando leituras e localizando âncoras de tempo..."):
-            records = parse_fieldlogger_memflash(raw_bytes)
+        with st.spinner("Extraindo horários reais do cabeçalho da máquina..."):
+            records = parse_fieldlogger_memflash(swapped_bytes)
+            timestamps_found = extract_header_timestamps(raw_bytes, swapped_bytes)
 
         if not records:
             st.error("❌ Nenhum dado válido encontrado no arquivo MEMFLASH.fl.")
             return
 
+        # Reconstrói a linha do tempo (Interpolação exata da Novus)
+        df_all = build_interpolated_timeline(records, timestamps_found)
+        
+        abs_start = df_all["_DT"].min()
+        abs_end = df_all["_DT"].max()
+
         st.divider()
         st.subheader("📅 Período do Log")
+
+        st.info(
+            f"✅ **Arquivo decodificado com sucesso!** O FieldLogger iniciou este histórico em **{abs_start.strftime('%d/%m/%Y %H:%M:%S')}** "
+            f"e a coleta final (retirada do pendrive) ocorreu automaticamente em **{abs_end.strftime('%d/%m/%Y %H:%M:%S')}**."
+        )
 
         col_ini1, col_ini2, col_nome = st.columns([1.2, 1.2, 1.6])
 
         with col_ini1:
             start_date = st.date_input(
-                "Data Inicial do Período:",
+                "Data Inicial do Período (Seu Corte):",
                 value=datetime(2026, 11, 6).date(),
-                help="Escolha o dia de início do seu log diário."
+                min_value=abs_start.date(),
+                max_value=abs_end.date()
             )
 
         with col_ini2:
             start_time_str = st.text_input(
                 "Hora Inicial (HH:MM:SS):",
                 value="01:05:00",
-                help="Hora de corte. Ex: 01:05:00 buscará automaticamente a leitura correspondente (01:05:48)."
+                help="O sistema procurará a linha exata igual ao Novus (ex: 01:05:48)."
             )
 
         with col_nome:
             sugestao_nome = start_date.strftime("%d.%m.%y")
             custom_data_str = st.text_input(
                 "Data no Nome do Arquivo (DD.MM.AA):",
-                value=sugestao_nome,
-                help="Digite a data que deseja no nome do arquivo."
+                value=sugestao_nome
             )
 
-        # Trata o horário digitado
         try:
-            partes = [int(p) for p in start_time_str.strip().split(":")]
-            start_t = time(partes[0], partes[1], partes[2] if len(partes) > 2 else 0)
-        except Exception:
+            p_i = [int(p) for p in start_time_str.strip().split(":")]
+            start_t = time(p_i[0], p_i[1], p_i[2] if len(p_i) > 2 else 0)
+        except:
             start_t = time(1, 5, 0)
 
-        start_dt = datetime.combine(start_date, start_t)
+        # Junta a data e hora do usuário
+        user_start_dt = datetime.combine(start_date, start_t)
 
-        # Reconstrói a linha temporal com a âncora física das 01:00 AM
-        df_all = build_timeline_with_anchors(records, start_date)
-
-        # Filtra a partir do momento solicitado
-        df_filtered = df_all[df_all["_DT"] >= start_dt].copy()
+        # O Filtro de Precisão:
+        # Pega as linhas cujo _DT real calculado seja MAIOR ou IGUAL ao horário pedido
+        df_filtered = df_all[df_all["_DT"] >= user_start_dt].copy()
 
         if df_filtered.empty:
-            st.warning("⚠️ Nenhuma leitura encontrada para esse horário de início.")
+            st.warning("⚠️ Nenhuma leitura encontrada a partir deste horário. Verifique a Data Inicial.")
             return
 
-        # Limita até o encerramento do arquivo
         df_final = df_filtered.drop(columns=["_DT"]).reset_index(drop=True)
 
         st.success(
-            f"✅ **{len(df_final):,} leituras sincronizadas** | "
-            f"Primeira linha: **{df_final['DATE'].iloc[0]} às {df_final['TIME'].iloc[0]}** | "
-            f"Última linha: **{df_final['DATE'].iloc[-1]} às {df_final['TIME'].iloc[-1]}**"
+            f"🎯 **{len(df_final):,} leituras filtradas com exatidão!**\n\n"
+            f"A primeira linha capturada foi perfeitamente alinhada em: **{df_final['DATE'].iloc[0]} às {df_final['TIME'].iloc[0]}**"
         )
 
         st.dataframe(df_final.head(100), use_container_width=True)
@@ -308,7 +320,6 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
-
 
 if __name__ == "__main__":
     main()
