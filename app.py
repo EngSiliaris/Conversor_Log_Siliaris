@@ -1,5 +1,6 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 import io
+import re
 import struct
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -11,7 +12,7 @@ st.set_page_config(
     page_title="Conversor_Log_Siliaris", page_icon="🏭", layout="wide"
 )
 
-# Colunas na ordem oficial da planilha da Siliaris
+# Colunas oficiais da planilha Siliaris
 COLUMNS_ORDER = [
     "AIT-1 Analisador",
     "FQI-1 Medidor",
@@ -25,17 +26,37 @@ COLUMNS_ORDER = [
 ]
 
 
-def parse_fieldlogger_memflash(raw_bytes: bytes):
-    """Decodifica os blocos de 44 bytes do MEMFLASH.fl da Novus:
+def detect_file_end_timestamp(raw_bytes: bytes) -> datetime:
+    """Varre a memória do arquivo para detectar o carimbo final da coleta."""
+    valid_ts = []
+    MIN_TS = 1704067200  # 2024-01-01
+    MAX_TS = 1893456000  # 2030-01-01
+    total_len = len(raw_bytes)
 
-    [4 bytes marcador: \x80\xff\x00\x00]
-    [2 bytes tag/status]
-    [36 bytes: 9 floats IEEE 754 little-endian]
-    [2 bytes CRC16]
-    """
+    for i in range(0, min(total_len - 4, 300000), 2):
+        chunk = raw_bytes[i : i + 4]
+        val_le = struct.unpack("<I", chunk)[0]
+        if MIN_TS <= val_le <= MAX_TS:
+            valid_ts.append(val_le)
+        val_be = struct.unpack(">I", chunk)[0]
+        if MIN_TS <= val_be <= MAX_TS:
+            valid_ts.append(val_be)
+
+    if valid_ts:
+        ts_final = max(valid_ts)
+        return datetime.fromtimestamp(
+            ts_final, tz=timezone(timedelta(hours=-3))
+        ).replace(tzinfo=None)
+
+    # Fallback seguro para data/hora atual
+    return datetime.now().replace(microsecond=0)
+
+
+def parse_fieldlogger_memflash(raw_bytes: bytes):
+    """Extrai os 9 floats limpos de cada bloco de 44 bytes e desembaralha o buffer circular."""
     marker = b"\x80\xff\x00\x00"
     records = []
-
+    tags = []
     pos = 0
     total_len = len(raw_bytes)
 
@@ -44,22 +65,16 @@ def parse_fieldlogger_memflash(raw_bytes: bytes):
         if idx == -1 or idx + 44 > total_len:
             break
 
-        # Bloco de dados de 44 bytes
         chunk = raw_bytes[idx : idx + 44]
-
-        # Os 9 floats começam no byte 6 e vão até o byte 42 (36 bytes)
+        tag_val = struct.unpack("<H", chunk[4:6])[0]
         float_bytes = chunk[6:42]
+
         if len(float_bytes) == 36:
             floats = struct.unpack("<9f", float_bytes)
 
-            # Validação física: descarta blocos corrompidos ou em branco
-            # TI-1 geralmente está entre 20°C e 100°C
+            # Filtra blocos corrompidos ou em branco
             if 10.0 <= floats[0] <= 120.0 and abs(floats[8]) < 500.0:
-                # Ordem interna gravada no FieldLogger:
-                # 0: TI-1, 1: TI-2, 2: TI-3, 3: TI-4, 4: TI-5, 5: TI-6, 6: AIT-1, 7: FQI-1, 8: Vazao
                 ti_1, ti_2, ti_3, ti_4, ti_5, ti_6, ait_1, fqi_1, vazao = floats
-
-                # Remapeia para a ordem visual exata do Excel modelo da Siliaris
                 records.append(
                     {
                         "AIT-1 Analisador": round(float(ait_1), 3),
@@ -73,8 +88,22 @@ def parse_fieldlogger_memflash(raw_bytes: bytes):
                         "Vazao agua quent": round(float(vazao), 3),
                     }
                 )
+                tags.append(tag_val)
 
         pos = idx + 44
+
+    if not records:
+        return []
+
+    # Se a memória circular deu a volta (wrap around), desembaralha
+    wrap_idx = -1
+    for i in range(len(tags) - 1):
+        if tags[i] > tags[i + 1]:
+            wrap_idx = i + 1
+            break
+
+    if wrap_idx != -1:
+        records = records[wrap_idx:] + records[:wrap_idx]
 
     return records
 
@@ -114,7 +143,7 @@ def generate_excel_bytes(df_export: pd.DataFrame) -> bytes:
                 row_vals.append(str(val))
             else:
                 try:
-                    row_vals.append(float(val))
+                    row_vals.append(float(val))  # Salva número real no Excel
                 except (ValueError, TypeError):
                     row_vals.append(val)
         ws.append(row_vals)
@@ -144,14 +173,17 @@ def generate_excel_bytes(df_export: pd.DataFrame) -> bytes:
 def main():
     st.title("🏭 Conversor_Log_Siliaris")
     st.markdown(
-        "Conversão direta de **MEMFLASH.fl** para planilha Excel (.xlsx) nos padrões de coleta da fábrica."
+        "Conversão direta de **MEMFLASH.fl** para planilha Excel (.xlsx) mantendo a sincronia de segundos e formatação oficial."
     )
 
     col_m1, col_m2 = st.columns([1, 2])
     with col_m1:
         machine = st.selectbox(
-            "Equipamento:", ["UD-2-85-006", "UD-1-60-005", "UO-1-240-009"]
+            "Selecione o Equipamento:",
+            ["UD-2-85-006", "UD-1-60-005", "UO-1-240-009"],
         )
+
+    tag_maquina = "UD85" if "85" in machine else "UD60"
 
     uploaded_file = st.file_uploader(
         "Arraste e solte o arquivo MEMFLASH.fl aqui:",
@@ -164,46 +196,17 @@ def main():
 
         with st.spinner("Processando blocos binários de 44-bytes..."):
             records = parse_fieldlogger_memflash(raw_bytes)
+            auto_end_dt = detect_file_end_timestamp(raw_bytes)
 
         if not records:
-            st.error(
-                "❌ Não foi possível extrair dados válidos. O arquivo pode estar vazio ou corrompido."
-            )
+            st.error("❌ Nenhum dado válido encontrado no arquivo MEMFLASH.fl.")
             return
 
         total_pts = len(records)
 
-        st.success(
-            f"✅ **{total_pts:,} leituras válidas de 1 minuto** encontradas na memória do FieldLogger."
-        )
-
-        st.divider()
-        st.subheader("📅 Período do Log")
-
-        # Configuração do intervalo de tempo
-        # Por padrão, assume que o log finaliza na data/hora atual ou do dia anterior
-        hoje = datetime.now()
-
-        col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-
-        with col_d3:
-            end_date = st.date_input(
-                "Data Final do Arquivo:",
-                value=hoje.date(),
-                help="Data em que o arquivo foi coletado no FieldLogger.",
-            )
-        with col_d4:
-            end_time = st.time_input(
-                "Hora Final do Arquivo:",
-                value=datetime.strptime("01:05:48", "%H:%M:%S").time(),
-                help="Hora em que a coleta encerrou.",
-            )
-
-        end_dt = datetime.combine(end_date, end_time)
-
-        # Calcula a linha do tempo retroativa (1 minuto por leitura)
+        # Monta a linha temporal preservando os segundos reais do encerramento
         timestamps = [
-            end_dt - timedelta(minutes=(total_pts - 1 - i))
+            auto_end_dt - timedelta(minutes=(total_pts - 1 - i))
             for i in range(total_pts)
         ]
 
@@ -212,37 +215,75 @@ def main():
         df_all.insert(0, "DATE", [t.strftime("%d/%m/%Y") for t in timestamps])
         df_all.insert(0, "_DT", timestamps)
 
-        with col_d1:
+        st.divider()
+        st.subheader("📅 Período do Log")
+
+        # Exibição da Data Final Automática com segundos
+        st.info(
+            f"🔒 **Encerramento da Coleta (Automático do Arquivo):** "
+            f"**{auto_end_dt.strftime('%d/%m/%Y')} às {auto_end_dt.strftime('%H:%M:%S')}**"
+        )
+
+        col_ini1, col_ini2, col_nome = st.columns([1.2, 1.2, 1.6])
+
+        with col_ini1:
             start_date = st.date_input(
-                "Data Inicial Desejada:",
-                value=(end_dt - timedelta(days=1)).date(),
-                help="Escolha o dia de início da sua leitura diária.",
-            )
-        with col_d2:
-            start_time = st.time_input(
-                "Hora Inicial Desejada:",
-                value=datetime.strptime("01:05:00", "%H:%M:%S").time(),
-                help="Hora de corte inicial (ex: 01:05:00 para repetir a última linha anterior).",
+                "Data Inicial do Período:",
+                value=(auto_end_dt - timedelta(days=1)).date(),
+                help="Escolha o dia em que você quer que o novo log comece.",
             )
 
-        start_dt = datetime.combine(start_date, start_time)
+        with col_ini2:
+            # Entrada de hora com segundos via texto (permite precisão máxima: HH:MM:SS)
+            sugestao_hora = "01:05:00"
+            hora_digitada = st.text_input(
+                "Hora Inicial (HH:MM:SS):",
+                value=sugestao_hora,
+                help="Digite a hora de corte (ex: 01:05:00 ou 01:05:48). O sistema busca a leitura correspondente a partir desse momento.",
+            )
 
-        # Filtra o período selecionado
+        # Trata a hora digitada pelo usuário
+        try:
+            partes = [int(p) for p in hora_digitada.strip().split(":")]
+            if len(partes) == 2:
+                user_time = time(partes[0], partes[1], 0)
+            elif len(partes) == 3:
+                user_time = time(partes[0], partes[1], partes[2])
+            else:
+                user_time = time(1, 5, 0)
+        except Exception:
+            user_time = time(1, 5, 0)
+
+        with col_nome:
+            sugestao_data_nome = start_date.strftime("%d.%m.%y")
+            custom_data_str = st.text_input(
+                "Data no Nome do Arquivo (DD.MM.AA):",
+                value=sugestao_data_nome,
+                help="Você pode alterar para o dia de referência do turno (ex: 11.11.26 ou 10.11.26).",
+            )
+
+        start_dt = datetime.combine(start_date, user_time)
+
+        # Filtro inteligente: pega a partir do momento solicitado
         df_filtered = df_all[
-            (df_all["_DT"] >= start_dt) & (df_all["_DT"] <= end_dt)
+            (df_all["_DT"] >= start_dt) & (df_all["_DT"] <= auto_end_dt)
         ].copy()
         df_final = df_filtered.drop(columns=["_DT"]).reset_index(drop=True)
 
-        st.caption(
-            f"Mostrando **{len(df_final):,} registros** entre **{start_dt.strftime('%d/%m/%Y %H:%M:%S')}** e **{end_dt.strftime('%d/%m/%Y %H:%M:%S')}**."
+        if df_final.empty:
+            st.warning(
+                "⚠️ Nenhuma leitura encontrada para esse horário. Verifique a data/hora inicial."
+            )
+            return
+
+        st.success(
+            f"✅ **{len(df_final):,} leituras prontas** — Primeira linha: **{df_final['DATE'].iloc[0]} às {df_final['TIME'].iloc[0]}** | Última linha: **{df_final['DATE'].iloc[-1]} às {df_final['TIME'].iloc[-1]}**"
         )
 
         st.dataframe(df_final.head(100), use_container_width=True)
 
-        # Nome automático idêntico ao modelo (ex: UD85 06.11.26.xlsx)
-        tag_maquina = "UD85" if "85" in machine else "UD60"
-        data_str = start_date.strftime("%d.%m.%y")
-        filename_excel = f"{tag_maquina} {data_str}.xlsx"
+        nome_limpo = custom_data_str.strip() or sugestao_data_nome
+        filename_excel = f"{tag_maquina} {nome_limpo}.xlsx"
 
         excel_bytes = generate_excel_bytes(df_final)
 
