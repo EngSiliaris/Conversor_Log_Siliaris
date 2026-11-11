@@ -7,14 +7,10 @@ from openpyxl.utils import get_column_letter
 import pandas as pd
 import streamlit as st
 
-# ==============================================================================
-# CONFIGURAÇÕES GERAIS E PERFIS PADRÃO
-# ==============================================================================
 st.set_page_config(
     page_title="Conversor_Log_Siliaris", page_icon="🏭", layout="wide"
 )
 
-# Perfis pré-configurados para as máquinas UD
 PROFILES = {
     "UD-2-85-006": [
         "AIT-1 Analisador",
@@ -41,244 +37,110 @@ PROFILES = {
 }
 
 
-# ==============================================================================
-# PROCESSAMENTO BINÁRIO (.fl)
-# ==============================================================================
-def parse_fl_file(raw_bytes: bytes, num_channels: int, tz_offset_hours: int = -3):
-    if not raw_bytes:
-        return pd.DataFrame()
+def generate_diagnostic_report(raw_bytes: bytes) -> str:
+    """Gera um relatório técnico em texto seguro contendo amostras hexadecimais
 
-    # 1. Inversão dos pares de bytes (correção de endianness 16-bit)
-    ba = bytearray(raw_bytes)
-    if len(ba) % 2 != 0:
-        ba = ba[:-1]
+    do arquivo para identificação exata da estrutura do FieldLogger.
+    """
+    report = []
+    total_len = len(raw_bytes)
+    report.append(f"=== DIAGNÓSTICO DO ARQUIVO MEMFLASH.fl ===")
+    report.append(f"Tamanho Total: {total_len:,} bytes ({total_len/1024:.2f} KB)")
+    report.append("")
 
-    ba[0::2], ba[1::2] = ba[1::2], ba[0::2]
-    swapped = bytes(ba)
+    # Primeiros 1024 bytes (Cabeçalho do FieldLogger)
+    report.append("--- [BLOCO 1] CABEÇALHO (PRIMEIROS 1024 BYTES) ---")
+    header_slice = raw_bytes[:1024]
+    report.append(header_slice.hex())
+    report.append("")
 
-    # 2. Split pelo marcador de registro do FieldLogger (\xff\x80\x00\x00)
-    marker = b"\xff\x80\x00\x00"
-    chunks = swapped.split(marker)
+    # Últimos 1024 bytes
+    report.append("--- [BLOCO 2] FIM DO ARQUIVO (ÚLTIMOS 1024 BYTES) ---")
+    tail_slice = raw_bytes[-1024:] if total_len >= 1024 else raw_bytes
+    report.append(tail_slice.hex())
+    report.append("")
 
-    bytes_per_record = 4 + (num_channels * 4)
-    tz = timezone(timedelta(hours=tz_offset_hours))
-    records = []
-    float_fmt = f"<{num_channels}f"
-
-    for chunk in chunks[1:]:  # Pula o cabeçalho antes do primeiro marcador
-        if len(chunk) >= bytes_per_record:
-            ts = struct.unpack("<I", chunk[:4])[0]
-
-            # Validação do timestamp Unix (anos entre 2000 e 2050)
-            if 946684800 <= ts <= 2524608000:
-                dt = datetime.fromtimestamp(ts, tz=tz)
-                floats = struct.unpack(
-                    float_fmt, chunk[4 : 4 + (num_channels * 4)]
+    # Varredura à procura de padrões de temperatura conhecidos (50.0 a 85.0 °C)
+    report.append("--- [BLOCO 3] LOCALIZADOR DE VALORES REAIS (IEEE 754) ---")
+    matches = 0
+    # Teste Little-Endian padrão
+    for offset in range(0, min(total_len - 4, 100000), 2):
+        chunk = raw_bytes[offset : offset + 4]
+        try:
+            val = struct.unpack("<f", chunk)[0]
+            # Procura por números típicos do seu processo (Ex: 57.5, 41.7, 82.1)
+            if 56.0 <= val <= 59.0:
+                snippet = raw_bytes[max(0, offset - 16) : offset + 48]
+                report.append(
+                    f"Possível valor de Temp (~{val:.3f}) no offset {offset} (0x{offset:X}):"
                 )
-                floats_cleaned = [
-                    round(float(v), 3) if abs(v) < 1e7 else 0.0 for v in floats
-                ]
+                report.append(f"Hex vizinho: {snippet.hex()}")
+                matches += 1
+                if matches >= 5:
+                    break
+        except Exception:
+            pass
 
-                records.append(
-                    {
-                        "DATETIME": dt,
-                        "DATE": dt.strftime("%d/%m/%Y"),
-                        "TIME": dt.strftime("%H:%M:%S"),
-                        "values": floats_cleaned,
-                    }
-                )
-
-    if not records:
-        return pd.DataFrame()
-
-    data_dict = {
-        "DATETIME": [r["DATETIME"] for r in records],
-        "DATE": [r["DATE"] for r in records],
-        "TIME": [r["TIME"] for r in records],
-    }
-
-    for i in range(num_channels):
-        data_dict[f"CH_{i}"] = [r["values"][i] for r in records]
-
-    df = pd.DataFrame(data_dict)
-    df = df.sort_values("DATETIME").reset_index(drop=True)
-    return df
+    return "\n".join(report)
 
 
-# ==============================================================================
-# GERAÇÃO DO EXCEL (.xlsx) COM DADOS NUMÉRICOS
-# ==============================================================================
-def generate_excel_bytes(df_export: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Dados de Processo"
-
-    # Estilização padrão industrial
-    header_fill = PatternFill(
-        start_color="1F497D", end_color="1F497D", fill_type="solid"
-    )
-    header_font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
-    data_font = Font(name="Calibri", size=10)
-    border_thin = Border(
-        left=Side(style="thin", color="D9D9D9"),
-        right=Side(style="thin", color="D9D9D9"),
-        top=Side(style="thin", color="D9D9D9"),
-        bottom=Side(style="thin", color="D9D9D9"),
-    )
-
-    headers = list(df_export.columns)
-    ws.append(headers)
-
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for _, row in df_export.iterrows():
-        row_vals = []
-        for col in headers:
-            val = row[col]
-            if col in ["DATE", "TIME"]:
-                row_vals.append(str(val))
-            else:
-                try:
-                    row_vals.append(float(val))  # Salva como FLOAT real no Excel
-                except (ValueError, TypeError):
-                    row_vals.append(val)
-        ws.append(row_vals)
-
-    for row in ws.iter_rows(
-        min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column
-    ):
-        for col_idx, cell in enumerate(row, start=1):
-            cell.font = data_font
-            cell.border = border_thin
-            col_name = headers[col_idx - 1]
-            if col_name in ["DATE", "TIME"]:
-                cell.alignment = Alignment(horizontal="center")
-            else:
-                cell.alignment = Alignment(horizontal="right")
-                cell.number_format = (
-                    "#,##0.000"  # Padrão com 3 casas decimais
-                )
-
-    for col in ws.columns:
-        col_letter = get_column_letter(col[0].column)
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
-
-    wb.save(output)
-    return output.getvalue()
-
-
-# ==============================================================================
-# INTERFACE PRINCIPAL
-# ==============================================================================
 def main():
     st.title("🏭 Conversor_Log_Siliaris")
-    st.markdown(
-        "Extração direta de dados do arquivo **MEMFLASH.fl** para planilha Excel (.xlsx)."
+
+    tab_conversor, tab_diag = st.tabs(
+        ["📄 Conversor de Log", "🔍 Diagnóstico & Amostra (.txt)"]
     )
 
-    # 1. Seleção do equipamento
-    selected_machine = st.selectbox(
-        "Selecione o Equipamento:", list(PROFILES.keys())
-    )
-    active_channels = PROFILES[selected_machine]
-
-    # 2. Upload do arquivo binário
-    uploaded_file = st.file_uploader(
-        "Arraste e solte o arquivo MEMFLASH.fl aqui:",
-        type=["fl", "bin"],
-    )
-
-    if uploaded_file is not None:
-        raw_bytes = uploaded_file.read()
-
-        with st.spinner("Processando e decodificando o arquivo binário..."):
-            df_raw = parse_fl_file(
-                raw_bytes, len(active_channels), tz_offset_hours=-3
-            )
-
-        if df_raw.empty:
-            st.error(
-                "❌ Nenhum dado válido encontrado. Verifique se o arquivo MEMFLASH.fl está íntegro."
-            )
-            return
-
-        rename_map = {
-            f"CH_{i}": active_channels[i] for i in range(len(active_channels))
-        }
-        df_raw = df_raw.rename(columns=rename_map)
-
-        min_dt = df_raw["DATETIME"].min()
-        max_dt = df_raw["DATETIME"].max()
-
-        st.divider()
-        st.subheader("📅 Filtro de Período")
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            sel_start_date = st.date_input(
-                "Data Inicial do Log:",
-                value=min_dt.date(),
-                min_value=min_dt.date(),
-                max_value=max_dt.date(),
-            )
-        with c2:
-            sel_start_time = st.time_input("Hora Inicial:", value=min_dt.time())
-        with c3:
-            st.date_input(
-                "Data Final (automática):",
-                value=max_dt.date(),
-                disabled=True,
-            )
-        with c4:
-            st.time_input(
-                "Hora Final (automática):",
-                value=max_dt.time(),
-                disabled=True,
-            )
-
-        start_datetime = datetime.combine(
-            sel_start_date, sel_start_time
-        ).replace(tzinfo=min_dt.tzinfo)
-
-        df_filtered = df_raw[
-            (df_raw["DATETIME"] >= start_datetime)
-            & (df_raw["DATETIME"] <= max_dt)
-        ].copy()
-        display_columns = ["DATE", "TIME"] + active_channels
-        df_final = df_filtered[display_columns].reset_index(drop=True)
-
-        if df_final.empty:
-            st.warning(
-                "⚠️ Nenhum registro encontrado para esse horário. Escolha um horário inicial anterior."
-            )
-            return
-
-        st.success(
-            f"✅ **{len(df_final):,} registros** prontos ({df_final['DATE'].iloc[0]} às {df_final['TIME'].iloc[0]} até {df_final['DATE'].iloc[-1]} às {df_final['TIME'].iloc[-1]})."
+    with tab_conversor:
+        st.markdown(
+            "Extração direta de dados do arquivo **MEMFLASH.fl** para planilha Excel (.xlsx)."
+        )
+        selected_machine = st.selectbox(
+            "Selecione o Equipamento:", list(PROFILES.keys())
+        )
+        uploaded_file = st.file_uploader(
+            "Arraste e solte o arquivo MEMFLASH.fl aqui:",
+            type=["fl", "bin"],
+            key="file_conv",
         )
 
-        st.dataframe(df_final.head(50), use_container_width=True)
+        if uploaded_file is not None:
+            st.info(
+                "Arquivo carregado com sucesso. Use a aba **'🔍 Diagnóstico & Amostra (.txt)'** acima para extrairmos a estrutura correta!"
+            )
 
-        # Nome automático do Excel no seu padrão (Ex: UD85 05.11.26.xlsx)
-        tag_maquina = "UD85" if "85" in selected_machine else "UD60"
-        data_str = sel_start_date.strftime("%d.%m.%y")
-        filename_excel = f"{tag_maquina} {data_str}.xlsx"
-
-        excel_bytes = generate_excel_bytes(df_final)
-
-        st.download_button(
-            label=f"📥 Baixar Arquivo Excel ({filename_excel})",
-            data=excel_bytes,
-            file_name=filename_excel,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
+    with tab_diag:
+        st.subheader("🛠️ Extrator de Amostra para Ajuste de Precisão")
+        st.markdown(
+            "Como o arquivo `.fl` possui uma criptografia/empacotamento proprietário da Novus, "
+            "esta ferramenta extrai uma amostra em formato texto seguro para desvendarmos a estrutura exata."
         )
+
+        uploaded_diag = st.file_uploader(
+            "Envie o MEMFLASH.fl para gerar o relatório de diagnóstico:",
+            type=["fl", "bin"],
+            key="file_diag",
+        )
+
+        if uploaded_diag is not None:
+            raw_bytes = uploaded_diag.read()
+            with st.spinner("Gerando diagnóstico em formato texto seguro..."):
+                diag_text = generate_diagnostic_report(raw_bytes)
+
+            st.success("Diagnóstico gerado com sucesso!")
+
+            st.download_button(
+                label="📥 Baixar Amostra de Diagnóstico (amostra_diagnostico.txt)",
+                data=diag_text,
+                file_name="amostra_diagnostico.txt",
+                mime="text/plain",
+                type="primary",
+            )
+
+            with st.expander("Ver prévia do diagnóstico"):
+                st.text_area(
+                    "Texto do diagnóstico:", diag_text[:2000] + "\n...", height=300
+                )
 
 
 if __name__ == "__main__":
